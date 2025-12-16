@@ -1,93 +1,126 @@
 import os
-from flask import Flask, request, jsonify
-import requests
+import time
 import hmac
 import hashlib
-import time
+import json
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- KONFIGURASI DIAMBIL DARI SERVER (ENVIRONMENT VARIABLES) ---
+# --- KONFIGURASI (Auto-Load dari Vercel/Render) ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TRIPAY_API_KEY = os.environ.get("TRIPAY_API_KEY")
 TRIPAY_PRIVATE_KEY = os.environ.get("TRIPAY_PRIVATE_KEY")
 TRIPAY_MERCHANT_CODE = os.environ.get("TRIPAY_MERCHANT_CODE")
-TRIPAY_MODE = "api-sandbox" # Ganti 'api' jika sudah production
-# -------------------------------------------------------------
+TRIPAY_MODE = "api-sandbox" # Ubah ke 'api' jika sudah live production
+# ---------------------------------------------------
 
-def kirim_pesan_telegram(chat_id, pesan):
+def kirim_pesan(chat_id, text):
+    """Fungsi pembantu untuk kirim pesan ke Telegram"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": pesan}
+    payload = {"chat_id": chat_id, "text": text}
     requests.post(url, json=payload)
 
-@app.route('/')
-def home():
-    return "Bot Payment Server is Running!", 200
-
-# 1. Pemicu Transaksi (Contoh link: https://nama-app.onrender.com/beli?user_id=123)
-@app.route('/beli', methods=['GET'])
-def beli():
-    user_id = request.args.get('user_id')
-    if not user_id:
-        return "Error: Masukkan user_id", 400
-
-    ref_id = f'ORDER-{user_id}-{int(time.time())}' # Invoice Unik pakai waktu
+def buat_link_pembayaran(user_id):
+    """Fungsi request ke Tripay"""
+    merchant_ref = f"INV-{user_id}-{int(time.time())}" # Kode Unik
+    amount = 50000  # GANTI HARGA DI SINI
     
-    # Signature Keamanan Tripay
-    signature_string = TRIPAY_MERCHANT_CODE + ref_id + '50000'
+    # 1. Buat Signature Keamanan Tripay
+    signature_string = TRIPAY_MERCHANT_CODE + merchant_ref + str(amount)
     signature = hmac.new(
         TRIPAY_PRIVATE_KEY.encode(),
         signature_string.encode(),
         hashlib.sha256
     ).hexdigest()
 
+    # 2. Siapkan Data
     payload = {
-        'method': 'BRIVA', 
-        'merchant_ref': ref_id,
-        'amount': 50000,
-        'customer_name': 'Pelanggan Bot',
-        'customer_email': 'email@test.com',
+        'method': 'BRIVA', # Bisa diganti channel lain
+        'merchant_ref': merchant_ref,
+        'amount': amount,
+        'customer_name': f'User {user_id}',
+        'customer_email': 'pembeli@bot.com',
         'customer_phone': '08123456789',
-        'order_items': [{'name': 'Voucher Premium', 'price': 50000, 'quantity': 1}],
-        'return_url': 'https://t.me/UsernameBotAnda', # Redirect setelah bayar
-        'expired_time': (int(time.time()) + (24 * 60 * 60)),
+        'order_items': [
+            {'name': 'Produk Premium Bot', 'price': amount, 'quantity': 1}
+        ],
+        'return_url': 'https://t.me/', # Redirect setelah bayar
+        'expired_time': (int(time.time()) + (24 * 60 * 60)), # 24 Jam
         'signature': signature
     }
 
     headers = {'Authorization': f'Bearer {TRIPAY_API_KEY}'}
-    response = requests.post(
-        f'https://tripay.co.id/{TRIPAY_MODE}/transaction/create',
-        json=payload, headers=headers
-    )
     
-    data = response.json()
-    if data['success']:
-        checkout_url = data['data']['checkout_url']
-        kirim_pesan_telegram(user_id, f"Tagihan dibuat! Klik untuk bayar: {checkout_url}")
-        return f"Sukses! Link dikirim ke Telegram ID {user_id}"
-    else:
-        return f"Gagal: {data['message']}"
+    # 3. Tembak ke Tripay
+    try:
+        response = requests.post(
+            f'https://tripay.co.id/{TRIPAY_MODE}/transaction/create',
+            json=payload, headers=headers
+        )
+        data = response.json()
+        if data['success']:
+            return data['data']['checkout_url']
+        else:
+            return None
+    except Exception as e:
+        print(f"Error Tripay: {e}")
+        return None
 
-# 2. Webhook (Jalur Laporan Tripay)
+# --- RUTE 1: MENERIMA CHAT DARI TELEGRAM ---
+@app.route('/', methods=['POST', 'GET'])
+def telegram_handler():
+    if request.method == 'POST':
+        update = request.json
+        
+        # Cek apakah ada pesan baru
+        if 'message' in update:
+            chat_id = update['message']['chat']['id']
+            text = update['message'].get('text', '')
+
+            # LOGIKA JAWABAN BOT
+            if text == '/start':
+                balasan = "Halo! Selamat datang.\nKetik /beli untuk membeli paket Premium Rp 50.000."
+                kirim_pesan(chat_id, balasan)
+            
+            elif text == '/beli':
+                kirim_pesan(chat_id, "Mohon tunggu, sedang membuat tagihan... ⏳")
+                link = buat_link_pembayaran(chat_id)
+                if link:
+                    kirim_pesan(chat_id, f"✅ Tagihan Siap!\n\nSilakan bayar melalui link ini:\n{link}")
+                else:
+                    kirim_pesan(chat_id, "❌ Gagal membuat tagihan. Coba lagi nanti.")
+            
+            else:
+                kirim_pesan(chat_id, "Maaf, perintah tidak dikenali. Ketik /beli untuk order.")
+
+        return "OK", 200
+    return "Bot Telegram Active!", 200
+
+# --- RUTE 2: WEBHOOK (DIPANGGIL TRIPAY SAAT LUNAS) ---
 @app.route('/webhook', methods=['POST'])
-def webhook():
-    # Ambil data JSON dari Tripay
+def tripay_webhook():
     data = request.json
-    
-    # Validasi Signature Webhook (Opsional tapi disarankan agar tidak di-hack)
-    # Untuk tutorial ini kita skip validasi signature masuk agar simpel
-    
-    status = data.get('status') 
+    status = data.get('status')
     merchant_ref = data.get('merchant_ref')
     
+    # Jika Status LUNAS (PAID)
     if status == 'PAID':
-        # Format ref kita tadi: ORDER-USERID-WAKTU
-        # Kita ambil USERID-nya (elemen ke-1)
+        # Parse User ID dari merchant_ref (Format: INV-USERID-WAKTU)
         try:
-            user_id = merchant_ref.split('-')[1]
-            kirim_pesan_telegram(user_id, "✅ Pembayaran LUNAS! Fitur Premium Anda sudah aktif.")
-        except:
-            print("Gagal parsing ID user")
+            parts = merchant_ref.split('-')
+            user_id = parts[1] # Mengambil angka di tengah
+            
+            # KIRIM PRODUK / NOTIF KE USER DI SINI
+            pesan_sukses = (
+                "🎉 **PEMBAYARAN DITERIMA!**\n\n"
+                "Terima kasih. Fitur Premium Anda telah aktif.\n"
+                "Silakan akses grup VIP di link berikut: https://t.me/..."
+            )
+            kirim_pesan(user_id, pesan_sukses)
+        except Exception as e:
+            print(f"Gagal parse user ID: {e}")
 
     return jsonify({'success': True})
 
