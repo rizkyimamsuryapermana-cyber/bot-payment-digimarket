@@ -5,29 +5,37 @@ import hashlib
 import json
 import requests
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Wajib agar Website bisa akses
 
-# --- KONFIGURASI (Auto-Load dari Vercel/Render) ---
+# --- KONFIGURASI ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TRIPAY_API_KEY = os.environ.get("TRIPAY_API_KEY")
 TRIPAY_PRIVATE_KEY = os.environ.get("TRIPAY_PRIVATE_KEY")
 TRIPAY_MERCHANT_CODE = os.environ.get("TRIPAY_MERCHANT_CODE")
-TRIPAY_MODE = "api-sandbox" # Ubah ke 'api' jika sudah live production
-# ---------------------------------------------------
+TRIPAY_MODE = "api-sandbox" 
 
-def kirim_pesan(chat_id, text):
-    """Fungsi pembantu untuk kirim pesan ke Telegram"""
+# --- FUNGSI BANTUAN ---
+def kirim_pesan_telegram(chat_id, text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     requests.post(url, json=payload)
 
-def buat_link_pembayaran(user_id):
-    """Fungsi request ke Tripay"""
-    merchant_ref = f"INV-{user_id}-{int(time.time())}" # Kode Unik
-    amount = 50000  # GANTI HARGA DI SINI
+# Update: Menambahkan parameter 'custom_redirect'
+def generate_tripay_link(customer, items, amount, method_code='BRIVA', user_id_tele=None, custom_redirect=None):
     
-    # 1. Buat Signature Keamanan Tripay
+    if user_id_tele:
+        merchant_ref = f"INV-TELE-{user_id_tele}-{int(time.time())}"
+        # Jika dari Bot, return ke Telegram
+        url_tujuan = f"https://t.me/GantiDenganUsernameBotAnda" 
+    else:
+        merchant_ref = f"INV-WEB-{int(time.time())}"
+        # Jika dari Web, pakai URL custom (atau default ke Google kalau kosong)
+        url_tujuan = custom_redirect if custom_redirect else 'https://google.com'
+
+    # Signature Tripay
     signature_string = TRIPAY_MERCHANT_CODE + merchant_ref + str(amount)
     signature = hmac.new(
         TRIPAY_PRIVATE_KEY.encode(),
@@ -35,92 +43,112 @@ def buat_link_pembayaran(user_id):
         hashlib.sha256
     ).hexdigest()
 
-    # 2. Siapkan Data
     payload = {
-        'method': 'BRIVA', # Bisa diganti channel lain
+        'method': method_code,
         'merchant_ref': merchant_ref,
         'amount': amount,
-        'customer_name': f'User {user_id}',
-        'customer_email': 'pembeli@bot.com',
-        'customer_phone': '08123456789',
-        'order_items': [
-            {'name': 'Produk Premium Bot', 'price': amount, 'quantity': 1}
-        ],
-        'return_url': 'https://t.me/', # Redirect setelah bayar
-        'expired_time': (int(time.time()) + (24 * 60 * 60)), # 24 Jam
+        'customer_name': customer.get('name', 'Pelanggan'),
+        'customer_email': customer.get('email', 'email@test.com'),
+        'customer_phone': customer.get('phone', '08123456789'),
+        'order_items': items,
+        'return_url': url_tujuan, # <--- INI KUNCINYA
+        'expired_time': (int(time.time()) + (24 * 60 * 60)),
         'signature': signature
     }
 
     headers = {'Authorization': f'Bearer {TRIPAY_API_KEY}'}
-    
-    # 3. Tembak ke Tripay
     try:
         response = requests.post(
             f'https://tripay.co.id/{TRIPAY_MODE}/transaction/create',
             json=payload, headers=headers
         )
-        data = response.json()
-        if data['success']:
-            return data['data']['checkout_url']
-        else:
-            return None
+        return response.json()
     except Exception as e:
-        print(f"Error Tripay: {e}")
-        return None
+        return {'success': False, 'message': str(e)}
 
-# --- RUTE 1: MENERIMA CHAT DARI TELEGRAM ---
+# --- ENDPOINT 1: WEB APP (REACT) ---
+@app.route('/api/checkout', methods=['POST'])
+def checkout_web():
+    data = request.json
+    
+    cart = data.get('cart', [])
+    user = data.get('user', {})
+    total_amount = data.get('total', 0)
+    selected_method = data.get('paymentMethod', 'BRIVA')
+
+    # ==================================================
+    # GANTI URL DI BAWAH INI DENGAN LINK WEBSITE ANDA
+    # Contoh: 'https://tokosaya.vercel.app'
+    # ==================================================
+    website_url = 'https://digimarketbywebnest.netlify.app/' 
+
+    tripay_items = []
+    for item in cart:
+        tripay_items.append({
+            'name': item['name'],
+            'price': int(item['price']),
+            'quantity': int(item['quantity'])
+        })
+
+    result = generate_tripay_link(
+        customer={'name': user.get('name'), 'email': user.get('email')},
+        items=tripay_items,
+        amount=int(total_amount),
+        method_code=selected_method,
+        custom_redirect=website_url # <--- Mengirim URL Website
+    )
+
+    return jsonify(result)
+
+# --- ENDPOINT 2: BOT TELEGRAM ---
 @app.route('/', methods=['POST', 'GET'])
 def telegram_handler():
     if request.method == 'POST':
         update = request.json
-        
-        # Cek apakah ada pesan baru
         if 'message' in update:
             chat_id = update['message']['chat']['id']
             text = update['message'].get('text', '')
 
-            # LOGIKA JAWABAN BOT
             if text == '/start':
-                balasan = "Halo! Selamat datang.\nKetik /beli untuk membeli paket Premium Rp 50.000."
-                kirim_pesan(chat_id, balasan)
+                kirim_pesan_telegram(chat_id, "Halo! Ketik /beli untuk tes.")
             
             elif text == '/beli':
-                kirim_pesan(chat_id, "Mohon tunggu, sedang membuat tagihan... ⏳")
-                link = buat_link_pembayaran(chat_id)
-                if link:
-                    kirim_pesan(chat_id, f"✅ Tagihan Siap!\n\nSilakan bayar melalui link ini:\n{link}")
+                # Contoh transaksi Bot
+                kirim_pesan_telegram(chat_id, "Membuat tagihan... ⏳")
+                result = generate_tripay_link(
+                    customer={'name': 'User Telegram'},
+                    items=[{'name': 'Produk Bot', 'price': 50000, 'quantity': 1}],
+                    amount=50000,
+                    method_code='QRIS',
+                    user_id_tele=chat_id 
+                    # Tidak kirim custom_redirect, jadi otomatis ke t.me
+                )
+                
+                if result['success']:
+                    link = result['data']['checkout_url']
+                    kirim_pesan_telegram(chat_id, f"Link Bayar: {link}")
                 else:
-                    kirim_pesan(chat_id, "❌ Gagal membuat tagihan. Coba lagi nanti.")
-            
-            else:
-                kirim_pesan(chat_id, "Maaf, perintah tidak dikenali. Ketik /beli untuk order.")
+                    kirim_pesan_telegram(chat_id, "Gagal.")
+                    
+    return "OK", 200
 
-        return "OK", 200
-    return "Bot Telegram Active!", 200
-
-# --- RUTE 2: WEBHOOK (DIPANGGIL TRIPAY SAAT LUNAS) ---
+# --- ENDPOINT 3: WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
 def tripay_webhook():
     data = request.json
     status = data.get('status')
     merchant_ref = data.get('merchant_ref')
     
-    # Jika Status LUNAS (PAID)
     if status == 'PAID':
-        # Parse User ID dari merchant_ref (Format: INV-USERID-WAKTU)
         try:
             parts = merchant_ref.split('-')
-            user_id = parts[1] # Mengambil angka di tengah
-            
-            # KIRIM PRODUK / NOTIF KE USER DI SINI
-            pesan_sukses = (
-                "🎉 **PEMBAYARAN DITERIMA!**\n\n"
-                "Terima kasih. Fitur Premium Anda telah aktif.\n"
-                "Silakan akses grup VIP di link berikut: https://t.me/..."
-            )
-            kirim_pesan(user_id, pesan_sukses)
-        except Exception as e:
-            print(f"Gagal parse user ID: {e}")
+            if parts[1] == 'TELE':
+                user_id_tele = parts[2]
+                kirim_pesan_telegram(user_id_tele, "✅ Pembayaran LUNAS!")
+            elif parts[1] == 'WEB':
+                print(f"Web Order Lunas: {merchant_ref}")
+        except:
+            pass
 
     return jsonify({'success': True})
 
